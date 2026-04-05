@@ -20,6 +20,130 @@ Tremendous progress has been made in deep stereo matching to excel on benchmark 
   <img src="./teaser/input_output.gif" width="600"/>
 </p>
 
+# Our Orbbec Stereo Reconstruction Extension
+
+This repository is built on top of the original [FoundationStereo](https://github.com/NVlabs/FoundationStereo) codebase and extends it for practical Orbbec stereo-camera capture, evaluation, and 3D reconstruction.
+
+Our setup uses an Orbbec stereo depth camera to record:
+- `ir_left/` and `ir_right/`: rectified grayscale stereo pairs
+- `color/`: RGB images
+- `depth/`: raw measured depth from the device
+- `imu_data.csv`: IMU stream
+- `frame_timestamps.csv`: synchronization table
+- `camera_intrinsics.json`: color/depth intrinsics and cross-sensor extrinsics
+
+In our pipeline, the active infrared projector is disabled during capture so that the stereo model operates on cleaner passive IR imagery instead of projected dot patterns. Since FoundationStereo expects 3-channel image input, we convert each grayscale IR frame into a pseudo-RGB image by repeating the single channel three times before inference.
+
+## Our Contributions
+
+Compared with the upstream FoundationStereo release, this repository adds:
+
+- Orbbec data ingestion for recorded stereo sequences, using `ir_left` and `ir_right` folders directly.
+- A grayscale-to-3-channel preprocessing path so Orbbec passive IR images can be used with FoundationStereo without retraining.
+- Sequence inference tools for dense stereo estimation, metric-depth conversion, error analysis, and point-cloud export.
+- Comparison utilities between predicted stereo depth and the camera's raw measured depth.
+- Open3D-based reconstruction scripts for both raw depth and predicted depth.
+- A segmented reconstruction mode that avoids forcing unstable frames into one drifting global map.
+
+## Orbbec Workflow
+
+Our full workflow is:
+
+1. Capture synchronized Orbbec data with the IR projector disabled.
+2. Use `ir_left` and `ir_right` grayscale stereo pairs as the main stereo input.
+3. Replicate each grayscale frame to 3 channels so it matches FoundationStereo's RGB input convention.
+4. Run FoundationStereo to predict disparity and convert disparity to metric depth using the stereo baseline and camera intrinsics.
+5. Align predicted depth with the color camera using the extrinsics in `camera_intrinsics.json`.
+6. Reconstruct local 3D geometry with Open3D from:
+   - raw device depth, and/or
+   - FoundationStereo predicted depth.
+7. Perform segmented registration and fusion to reduce failure propagation when frame-to-frame pose estimation becomes unstable.
+
+## Data Assumptions
+
+The Orbbec sequence folder is expected to look like:
+
+```text
+recording_root/
+├── camera_intrinsics.json
+├── color/
+├── depth/
+├── frame_timestamps.csv
+├── imu_data.csv
+├── ir_left/
+├── ir_right/
+└── output_stride_1/
+    └── depth/
+```
+
+The reconstruction code uses:
+- `camera_intrinsics.json` for color/depth intrinsics and sensor extrinsics
+- `frame_timestamps.csv` for matching color, depth, and IR frames
+- `imu_data.csv` as an auxiliary motion prior
+
+## Depth Estimation on Orbbec IR Stereo
+
+We provide a dedicated script:
+
+```bash
+python scripts/run_orbbec_demo.py \
+  --data_dir /path/to/orbbec_recording \
+  --ckpt_dir ./pretrained_models/23-51-11/model_best_bp2.pth \
+  --out_dir /path/to/orbbec_recording/output_stride_1 \
+  --device_name gemini_435le \
+  --frame_stride 1
+```
+
+This script:
+- reads `ir_left/*.png` and `ir_right/*.png`
+- expands grayscale IR to 3 channels
+- runs FoundationStereo in sequence mode
+- saves predicted depth, disparity visualizations, metrics, and optional point clouds
+- compares predicted depth against raw Orbbec depth when available
+
+For faster processing on long sequences, the script also supports batching and optional disabling of extra analysis outputs.
+
+## Reconstruction
+
+We provide reconstruction scripts based on Open3D. The current recommended path is `gener_depth_reconstructer_v3.py`, which supports:
+
+- raw depth reconstruction
+- predicted depth reconstruction
+- RGB-D registration
+- ICP refinement
+- segmented reconstruction to prevent one failed alignment from corrupting the entire sequence
+
+Example:
+
+```bash
+python gener_depth_reconstructer_v3.py \
+  --data_dir /path/to/orbbec_recording \
+  --depth_source predicted \
+  --depth_dir /path/to/orbbec_recording/output_stride_1/depth \
+  --out_dir /path/to/orbbec_recording/output/reconstruction3_predicted \
+  --frame_stride 1
+```
+
+In practice, we recommend reconstructing both:
+- `--depth_source raw`
+- `--depth_source predicted`
+
+and comparing their stability and fusion quality.
+
+## Why Segmented Reconstruction
+
+For long handheld sequences, frame-to-frame registration can fail because of:
+- limited geometric overlap
+- noise in predicted depth
+- accumulated IMU drift
+- imperfect color-depth alignment
+
+Instead of forcing all frames into one global trajectory, our segmented reconstruction mode cuts the sequence into locally stable chunks and reconstructs each chunk independently. This makes the output more useful for diagnosis and local 3D inspection when full-scene global fusion is unreliable.
+
+## Attribution
+
+This repository is an engineering extension of FoundationStereo for Orbbec stereo-camera capture and 3D reconstruction. The core stereo network, training recipe, and original method are from the FoundationStereo authors. If you use this codebase in research, please cite the original FoundationStereo paper below.
+
 # Changelog
 | Date       | Description                                                                                                         |
 |------------|---------------------------------------------------------------------------------------------------------------------|
