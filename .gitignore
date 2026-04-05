@@ -1,6 +1,18 @@
 pretrained_models/*
 output/*
+output_*/
 *.pyc
 weight/
 __pycache__
 DATA/*
+*.whl
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+core/.vscode/
+core/foundation_stereo (copy).py
+summary.json
+temple/
+test_outputs/

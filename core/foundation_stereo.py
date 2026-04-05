@@ -9,6 +9,7 @@
 
 import torch,pdb,logging,timm
 import torch.nn as nn
+import safetensors.torch
 import torch.nn.functional as F
 import sys,os
 code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -145,7 +146,7 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.cam = ChannelAttentionEnhancement(self.args.hidden_dims[0])
 
         self.context_zqr_convs = nn.ModuleList([nn.Conv2d(context_dims[i], args.hidden_dims[i]*3, kernel_size=3, padding=3//2) for i in range(self.args.n_gru_layers)])
-
+                 
         self.feature = Feature(args)
         self.proj_cmb = nn.Conv2d(self.feature.d_out[0], 12, kernel_size=1, padding=0)
 
