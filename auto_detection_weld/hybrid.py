@@ -360,6 +360,46 @@ def build_joint_roi_mask(selected: List[SegmentCandidate], max_gap_px: float = 2
     return band, {"mode": "joint_band", "band_area_px": int(band.sum())}
 
 
+def _select_pair_from_summary(
+    candidates: List[SegmentCandidate],
+    candidate_pairs: List[Dict[str, object]],
+    preferred_ids: Optional[Sequence[str]] = None,
+) -> List[SegmentCandidate]:
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    preferred = {item for item in (preferred_ids or []) if item}
+    for item in candidate_pairs:
+        pair_ids = [str(v).strip().upper() for v in item.get("pair", [])]
+        if len(pair_ids) != 2:
+            continue
+        if preferred and not preferred.issubset(set(pair_ids)):
+            continue
+        pair_score = float(item.get("pair_score", 0.0))
+        near_area = int(item.get("near_band_area_px", 0))
+        band_linearity = float(item.get("band_linearity", 0.0))
+        gap = item.get("min_edge_gap_px")
+        gap_ok = gap is None or float(gap) <= 12.0
+        if pair_score < 0.78 or near_area < 2000 or not gap_ok:
+            continue
+        selected: List[SegmentCandidate] = []
+        for cid in pair_ids:
+            candidate = by_id.get(cid)
+            if candidate is None:
+                selected = []
+                break
+            if candidate.border_touch_ratio > 0.28:
+                selected = []
+                break
+            if candidate.image_area_ratio > 0.38:
+                selected = []
+                break
+            selected.append(candidate)
+        if len(selected) == 2:
+            if band_linearity < 0.08 and pair_score < 0.9:
+                continue
+            return selected
+    return []
+
+
 class QwenReasoner:
     def __init__(self, python_executable: str, model_path: str, max_new_tokens: int) -> None:
         self.python_executable = python_executable
@@ -422,11 +462,17 @@ class QwenReasoner:
         return out
 
 
-def resolve_reasoned_candidates(candidates: List[SegmentCandidate], reasoning: Optional[Dict[str, object]], top_k: int) -> List[SegmentCandidate]:
+def resolve_reasoned_candidates(
+    candidates: List[SegmentCandidate],
+    reasoning: Optional[Dict[str, object]],
+    candidate_pairs: Optional[List[Dict[str, object]]] = None,
+    top_k: int = 2,
+) -> List[SegmentCandidate]:
     if not candidates:
         return []
     if reasoning is None:
-        return select_geometry_candidates(candidates, top_k)
+        pair_selected = _select_pair_from_summary(candidates, candidate_pairs or [])
+        return pair_selected[:top_k] if pair_selected else select_geometry_candidates(candidates, top_k)
     plate_ids = []
     roi_ids = []
     selected_ids = []
@@ -448,11 +494,17 @@ def resolve_reasoned_candidates(candidates: List[SegmentCandidate], reasoning: O
     else:
         wanted = selected_ids
     if not wanted:
-        return select_geometry_candidates(candidates, top_k)
+        pair_selected = _select_pair_from_summary(candidates, candidate_pairs or [])
+        return pair_selected[:top_k] if pair_selected else select_geometry_candidates(candidates, top_k)
     selected = [candidate for candidate in candidates if candidate.candidate_id in wanted]
     selected = [candidate for candidate in selected if candidate.border_touch_ratio <= 0.22]
     selected.sort(key=lambda candidate: wanted.index(candidate.candidate_id) if candidate.candidate_id in wanted else 999)
-    return (selected[:top_k] if selected else select_geometry_candidates(candidates, top_k))
+    if len(selected) >= top_k:
+        return selected[:top_k]
+    pair_selected = _select_pair_from_summary(candidates, candidate_pairs or [], preferred_ids=plate_ids[:2] if len(plate_ids) >= 2 else None)
+    if pair_selected:
+        return pair_selected[:top_k]
+    return selected[:top_k] if selected else select_geometry_candidates(candidates, top_k)
 
 
 def serialize_reasoning_for_json(reasoning: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:

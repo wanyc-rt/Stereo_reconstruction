@@ -145,7 +145,7 @@ class WeldDetectionPipeline:
         top_candidates = candidates[: self.config.sam_top_k_candidates]
         candidate_pairs = summarize_candidate_pairs(top_candidates)
         reasoning = self.qwen_reasoner.select(color, top_candidates, candidate_pairs, sam_dir, frame_id, self.config.prompt) if self.qwen_reasoner else None
-        selected = resolve_reasoned_candidates(top_candidates, reasoning, top_k=2)
+        selected = resolve_reasoned_candidates(top_candidates, reasoning, candidate_pairs=candidate_pairs, top_k=2)
         if not selected:
             selected = select_geometry_candidates(top_candidates, top_k=2)
         roi_mask, roi_meta = build_joint_roi_mask(selected)
