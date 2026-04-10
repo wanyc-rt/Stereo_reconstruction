@@ -1,0 +1,6 @@
+numpy
+opencv-python
+imageio
+open3d
+transformers
+Pillow
