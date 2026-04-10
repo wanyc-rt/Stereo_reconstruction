@@ -122,6 +122,18 @@ def normalize_map(arr: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return out
 
 
+def estimate_surface_curvature(xyz_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    curvature = np.zeros(xyz_map.shape[:2], dtype=np.float32)
+    if not np.any(valid_mask):
+        return curvature
+    for channel in range(3):
+        plane = xyz_map[:, :, channel].astype(np.float32)
+        lap = cv2.Laplacian(plane, cv2.CV_32F, ksize=3)
+        curvature += np.abs(lap)
+    curvature[~valid_mask] = 0.0
+    return curvature
+
+
 def ordered_centerline(mask: np.ndarray) -> Optional[np.ndarray]:
     ys, xs = np.where(mask)
     if len(xs) < 10:
@@ -218,6 +230,51 @@ def smooth_centerline(points_uv: np.ndarray, window: int = 7) -> np.ndarray:
     return np.asarray(smoothed, dtype=np.float32)
 
 
+def refine_centerline_with_3d(
+    centerline_px: np.ndarray,
+    refine_score: np.ndarray,
+    support_mask: np.ndarray,
+    search_radius: int = 8,
+) -> np.ndarray:
+    if centerline_px is None or len(centerline_px) < 3:
+        return centerline_px
+    pts = centerline_px.astype(np.float32).copy()
+    refined: List[np.ndarray] = []
+    h, w = refine_score.shape
+    for idx in range(len(pts)):
+        prev_pt = pts[max(idx - 1, 0)]
+        next_pt = pts[min(idx + 1, len(pts) - 1)]
+        tangent = next_pt - prev_pt
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm < 1e-6:
+            tangent = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            tangent = tangent / tangent_norm
+        ortho = np.array([-tangent[1], tangent[0]], dtype=np.float32)
+        center = pts[idx]
+        best_uv = center
+        cx = int(round(float(center[0])))
+        cy = int(round(float(center[1])))
+        if 0 <= cx < w and 0 <= cy < h and support_mask[cy, cx]:
+            best_score = float(refine_score[cy, cx])
+        else:
+            best_score = -1.0
+        for step in range(-search_radius, search_radius + 1):
+            probe = center + ortho * float(step)
+            u = int(round(float(probe[0])))
+            v = int(round(float(probe[1])))
+            if u < 0 or u >= w or v < 0 or v >= h:
+                continue
+            if not support_mask[v, u]:
+                continue
+            score = float(refine_score[v, u])
+            if score > best_score:
+                best_score = score
+                best_uv = np.array([u, v], dtype=np.float32)
+        refined.append(best_uv)
+    return np.asarray(refined, dtype=np.float32)
+
+
 def centerline_straightness(points_uv: np.ndarray) -> float:
     if points_uv is None or len(points_uv) < 3:
         return 0.0
@@ -303,6 +360,7 @@ def extract_groove_from_roi(
         return None
 
     normals, normal_change = estimate_normals_from_depth(depth_m, k_depth)
+    curvature = estimate_surface_curvature(xyz_map, valid)
     depth_fill = depth_m.copy().astype(np.float32)
     depth_fill[~np.isfinite(depth_fill)] = float(np.median(depth_fill[valid]))
     blur = cv2.GaussianBlur(depth_fill, (0, 0), 1.2)
@@ -329,23 +387,43 @@ def extract_groove_from_roi(
     score = score * ((1.0 - roi_center_prior_weight) + roi_center_prior_weight * roi_center_prior)
     score[~valid] = 0.0
 
-    thr = max(groove_score_threshold, float(np.percentile(score[valid], 94)))
-    groove_mask = score > thr
-    groove_mask = cv2.morphologyEx(groove_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2).astype(bool)
-    groove_mask = cv2.morphologyEx(groove_mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1).astype(bool)
-    groove_mask = largest_component(groove_mask, min_area=min_groove_area_px)
+    thick_thr = max(groove_score_threshold * 0.85, float(np.percentile(score[valid], 88)))
+    thick_band_mask = score > thick_thr
+    thick_band_mask = cv2.morphologyEx(thick_band_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2).astype(bool)
+    thick_band_mask = cv2.morphologyEx(thick_band_mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+    thick_band_mask = largest_component(thick_band_mask, min_area=max(min_groove_area_px * 2, 240))
+    thick_band_mask &= roi_mask
 
-    center_support = valid & (roi_center_prior > 0.35)
-    weighted_centerline = weighted_centerline_from_score(score, center_support, min_points=18)
-    threshold_centerline = ordered_centerline(groove_mask)
+    curvature_norm = normalize_map(curvature, valid)
+    valley_norm = normalize_map(valley, valid)
+    normal_norm = normalize_map(normal_change, valid)
+    seam_refine_score = 0.45 * normal_norm + 0.30 * curvature_norm + 0.25 * valley_norm
+    seam_refine_score *= (0.55 + 0.45 * roi_center_prior)
+    seam_refine_score[~(valid & thick_band_mask)] = 0.0
+
+    thin_valid = valid & thick_band_mask
+    if int(thin_valid.sum()) < max(min_groove_area_px, 120):
+        return None
+    thin_thr = max(0.35, float(np.percentile(seam_refine_score[thin_valid], 90)))
+    thin_seam_mask = seam_refine_score > thin_thr
+    thin_seam_mask = cv2.morphologyEx(thin_seam_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1).astype(bool)
+    thin_seam_mask = cv2.morphologyEx(thin_seam_mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+    thin_seam_mask = largest_component(thin_seam_mask, min_area=min_groove_area_px)
+    thin_seam_mask &= thick_band_mask
+
+    center_support = valid & thick_band_mask & (roi_center_prior > 0.25)
+    weighted_centerline = weighted_centerline_from_score(seam_refine_score, center_support, min_points=18)
+    threshold_centerline = ordered_centerline(thin_seam_mask)
     if weighted_centerline is not None:
         centerline_px = weighted_centerline
-        groove_mask = groove_mask_from_centerline(centerline_px, roi_mask.shape, thickness=9) & roi_mask
     else:
         centerline_px = threshold_centerline
     if centerline_px is None:
         return None
+    centerline_px = refine_centerline_with_3d(centerline_px, seam_refine_score, thick_band_mask, search_radius=9)
     centerline_px = smooth_centerline(centerline_px, window=7)
+    thin_seam_mask = groove_mask_from_centerline(centerline_px, roi_mask.shape, thickness=5) & thick_band_mask
+    groove_mask = groove_mask_from_centerline(centerline_px, roi_mask.shape, thickness=9) & thick_band_mask
     straightness = centerline_straightness(centerline_px)
     smoothness = centerline_smoothness(centerline_px)
     if straightness > 0.9 and smoothness < 0.5 and len(centerline_px) >= 10:
@@ -373,9 +451,13 @@ def extract_groove_from_roi(
     approach = approach / max(np.linalg.norm(approach), 1e-6)
     out = _fit_line_outputs(points_3d, uv, approach)
     out["groove_mask"] = groove_mask
+    out["thick_band_mask"] = thick_band_mask
+    out["thin_seam_mask"] = thin_seam_mask
     out["normals"] = normals
     out["normal_change"] = normal_change
-    out["score_map"] = score
+    out["curvature_map"] = curvature
+    out["score_map"] = seam_refine_score
+    out["coarse_score_map"] = score
     out["roi_center_prior"] = roi_center_prior
     out["centerline_straightness"] = straightness
     out["centerline_smoothness"] = smoothness

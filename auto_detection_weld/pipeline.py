@@ -306,14 +306,22 @@ class WeldDetectionPipeline:
             vis = overlay_mask(vis, plates[0]['mask'], (255, 0, 0))
         if len(plates) >= 2 and 'mask' in plates[1]:
             vis = overlay_mask(vis, plates[1]['mask'], (0, 0, 255))
+        if 'thick_band_mask' in groove:
+            vis = overlay_mask(vis, groove['thick_band_mask'], (255, 180, 0))
+        if 'thin_seam_mask' in groove:
+            vis = overlay_mask(vis, groove['thin_seam_mask'], (0, 255, 255))
         vis = overlay_mask(vis, groove['groove_mask'], (255, 180, 0))
         vis = draw_polyline(vis, groove['centerline_pixels'], (0, 255, 0), 2)
         target_uv = np.round(groove['centerline_pixels'][len(groove['centerline_pixels']) // 2]).astype(np.int32)
         cv2.circle(vis, tuple(target_uv.tolist()), 6, (255, 255, 0), -1, cv2.LINE_AA)
 
         score_vis = cv2.applyColorMap((np.clip(groove['score_map'], 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_JET)[:, :, ::-1]
+        coarse_score_vis = cv2.applyColorMap((np.clip(groove.get('coarse_score_map', groove['score_map']), 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_JET)[:, :, ::-1]
         normal_vis = cv2.applyColorMap((np.clip(groove['normal_change'], 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)[:, :, ::-1]
+        curvature_vis = cv2.applyColorMap((np.clip(groove.get('curvature_map', np.zeros_like(depth_m)), 0, np.percentile(groove.get('curvature_map', np.zeros_like(depth_m))[valid], 95) if np.any(valid) else 1.0) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)[:, :, ::-1]
         normal_rgb_vis = make_normal_vis(groove['normals'], valid_mask=valid) if 'normals' in groove else np.zeros_like(color)
+        thick_band_vis = overlay_mask(color.copy(), groove['thick_band_mask'], (255, 180, 0)) if 'thick_band_mask' in groove else color.copy()
+        thin_seam_vis = overlay_mask(color.copy(), groove['thin_seam_mask'], (0, 255, 255)) if 'thin_seam_mask' in groove else color.copy()
         self._show_runtime(frame['frame_id'], {'color': color, 'score': score_vis, 'normal_change': normal_vis, 'result': vis})
 
         vis_dir = os.path.join(output_dir, 'vis')
@@ -324,8 +332,12 @@ class WeldDetectionPipeline:
         ensure_dir(cloud_dir)
         imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_weld_detection.png"), vis)
         imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_score.png"), score_vis)
+        imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_coarse_score.png"), coarse_score_vis)
         imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_normal_change.png"), normal_vis)
         imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_normal_rgb.png"), normal_rgb_vis)
+        imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_curvature.png"), curvature_vis)
+        imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_thick_band.png"), thick_band_vis)
+        imageio.imwrite(os.path.join(vis_dir, f"{frame['frame_id']}_thin_seam.png"), thin_seam_vis)
 
         point_cloud_path = None
         aligned_color_path = os.path.join(vis_dir, f"{frame['frame_id']}_color_aligned_to_depth.png")
@@ -372,6 +384,10 @@ class WeldDetectionPipeline:
             'saved_normal_rgb_path': os.path.join(vis_dir, f"{frame['frame_id']}_normal_rgb.png"),
             'saved_normal_change_path': os.path.join(vis_dir, f"{frame['frame_id']}_normal_change.png"),
             'saved_score_path': os.path.join(vis_dir, f"{frame['frame_id']}_score.png"),
+            'saved_coarse_score_path': os.path.join(vis_dir, f"{frame['frame_id']}_coarse_score.png"),
+            'saved_curvature_path': os.path.join(vis_dir, f"{frame['frame_id']}_curvature.png"),
+            'saved_thick_band_path': os.path.join(vis_dir, f"{frame['frame_id']}_thick_band.png"),
+            'saved_thin_seam_path': os.path.join(vis_dir, f"{frame['frame_id']}_thin_seam.png"),
             'saved_color_aligned_path': aligned_color_path,
             'saved_color_depth_overlay_path': alignment_overlay_path,
             'saved_colorized_depth_cloud_path': point_cloud_path,
