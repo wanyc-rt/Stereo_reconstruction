@@ -2,7 +2,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +19,7 @@ _CANDIDATE_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 @dataclass
 class SegmentCandidate:
     candidate_id: str
+    candidate_source: str
     mask: np.ndarray
     bbox: List[int]
     area_px: int
@@ -39,6 +39,7 @@ class SegmentCandidate:
     def to_dict(self) -> Dict[str, object]:
         return {
             "candidate_id": self.candidate_id,
+            "candidate_source": self.candidate_source,
             "bbox": self.bbox,
             "area_px": self.area_px,
             "valid_depth_ratio": self.valid_depth_ratio,
@@ -54,6 +55,12 @@ class SegmentCandidate:
             "geometry_score": self.geometry_score,
             "sam_score": self.sam_score,
         }
+
+
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    inter = float((mask_a & mask_b).sum())
+    union = float((mask_a | mask_b).sum())
+    return inter / max(union, 1.0)
 
 
 def _mask_edge(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
@@ -226,6 +233,7 @@ def build_segment_candidates(
         candidates.append(
             SegmentCandidate(
                 candidate_id=_CANDIDATE_LABELS[idx],
+                candidate_source="sam",
                 mask=mask,
                 bbox=bbox,
                 area_px=area_px,
@@ -245,6 +253,146 @@ def build_segment_candidates(
         )
     candidates.sort(key=lambda item: item.geometry_score, reverse=True)
     return candidates
+
+
+def build_geometry_candidates(
+    plates: List[Dict[str, object]],
+    valid_mask: np.ndarray,
+) -> List[SegmentCandidate]:
+    h, w = valid_mask.shape
+    candidates: List[SegmentCandidate] = []
+    for idx, plate in enumerate(plates):
+        if idx >= len(_CANDIDATE_LABELS):
+            break
+        mask = np.asarray(plate.get("mask"), dtype=bool)
+        if mask.shape != valid_mask.shape:
+            continue
+        area_px = int(mask.sum())
+        if area_px <= 0:
+            continue
+        bbox = plate.get("bbox") or _bbox_from_mask(mask)
+        valid_depth_ratio = float((mask & valid_mask).sum() / max(area_px, 1))
+        border_touch_ratio = _mask_border_touch_ratio(mask)
+        fill_ratio = _mask_fill_ratio(mask, bbox)
+        area_ratio = float(area_px / float(h * w))
+        ys, xs = np.where(mask)
+        centroid_uv = [float(xs.mean()), float(ys.mean())] if len(xs) else [0.0, 0.0]
+        dx = (centroid_uv[0] - 0.5 * w) / max(0.5 * w, 1.0)
+        dy = (centroid_uv[1] - 0.5 * h) / max(0.5 * h, 1.0)
+        center_distance_norm = float(np.sqrt(dx * dx + dy * dy))
+        plane_normal = plate.get("plane_normal")
+        plane_offset_m = plate.get("plane_offset_m")
+        normal_z_abs = abs(float(plane_normal[2])) if isinstance(plane_normal, (list, tuple)) and len(plane_normal) >= 3 else 0.0
+        plane_inlier_ratio = float(plate.get("plane_inlier_ratio", 1.0 if plane_normal is not None else 0.0))
+        score = _geometry_score(
+            area_ratio,
+            border_touch_ratio,
+            valid_depth_ratio,
+            plane_inlier_ratio,
+            fill_ratio,
+            center_distance_norm,
+            normal_z_abs,
+        )
+        candidates.append(
+            SegmentCandidate(
+                candidate_id=_CANDIDATE_LABELS[idx],
+                candidate_source="geometry",
+                mask=mask,
+                bbox=[int(v) for v in bbox],
+                area_px=area_px,
+                valid_depth_ratio=valid_depth_ratio,
+                plane_inlier_ratio=plane_inlier_ratio,
+                border_touch_ratio=border_touch_ratio,
+                bbox_fill_ratio=fill_ratio,
+                image_area_ratio=area_ratio,
+                centroid_uv=centroid_uv,
+                center_distance_norm=center_distance_norm,
+                plane_normal=list(plane_normal) if isinstance(plane_normal, (list, tuple)) else None,
+                plane_offset_m=float(plane_offset_m) if plane_offset_m is not None else None,
+                normal_z_abs=normal_z_abs,
+                geometry_score=score,
+                sam_score=0.0,
+            )
+        )
+    candidates.sort(key=lambda item: item.geometry_score, reverse=True)
+    return candidates
+
+
+def relabel_candidates(candidates: List[SegmentCandidate]) -> List[SegmentCandidate]:
+    relabeled: List[SegmentCandidate] = []
+    for idx, candidate in enumerate(candidates):
+        if idx >= len(_CANDIDATE_LABELS):
+            break
+        relabeled.append(
+            SegmentCandidate(
+                candidate_id=_CANDIDATE_LABELS[idx],
+                candidate_source=candidate.candidate_source,
+                mask=candidate.mask,
+                bbox=list(candidate.bbox),
+                area_px=candidate.area_px,
+                valid_depth_ratio=candidate.valid_depth_ratio,
+                plane_inlier_ratio=candidate.plane_inlier_ratio,
+                border_touch_ratio=candidate.border_touch_ratio,
+                bbox_fill_ratio=candidate.bbox_fill_ratio,
+                image_area_ratio=candidate.image_area_ratio,
+                centroid_uv=list(candidate.centroid_uv),
+                center_distance_norm=candidate.center_distance_norm,
+                plane_normal=list(candidate.plane_normal) if candidate.plane_normal is not None else None,
+                plane_offset_m=candidate.plane_offset_m,
+                normal_z_abs=candidate.normal_z_abs,
+                geometry_score=candidate.geometry_score,
+                sam_score=candidate.sam_score,
+            )
+        )
+    return relabeled
+
+
+def merge_candidate_sources(
+    sam_candidates: List[SegmentCandidate],
+    geometry_candidates: List[SegmentCandidate],
+    max_candidates: int,
+    dedup_iou_threshold: float = 0.72,
+) -> List[SegmentCandidate]:
+    merged: List[SegmentCandidate] = []
+    ordered = list(sam_candidates) + list(geometry_candidates)
+    ordered.sort(
+        key=lambda item: (
+            item.geometry_score,
+            0.35 if item.candidate_source == "geometry" else 0.0,
+            item.sam_score,
+        ),
+        reverse=True,
+    )
+    for candidate in ordered:
+        duplicate = False
+        for kept in merged:
+            iou = _mask_iou(candidate.mask, kept.mask)
+            if iou >= dedup_iou_threshold:
+                duplicate = True
+                if (
+                    candidate.candidate_source == "geometry"
+                    and kept.candidate_source == "sam"
+                    and candidate.geometry_score >= kept.geometry_score - 0.05
+                ):
+                    kept.candidate_source = "sam+geometry"
+                    kept.plane_normal = candidate.plane_normal or kept.plane_normal
+                    kept.plane_offset_m = candidate.plane_offset_m if candidate.plane_offset_m is not None else kept.plane_offset_m
+                    kept.plane_inlier_ratio = max(kept.plane_inlier_ratio, candidate.plane_inlier_ratio)
+                    kept.geometry_score = max(kept.geometry_score, candidate.geometry_score)
+                elif (
+                    candidate.candidate_source == "sam"
+                    and kept.candidate_source == "geometry"
+                    and candidate.sam_score > 0.0
+                ):
+                    kept.candidate_source = "sam+geometry"
+                    kept.sam_score = max(kept.sam_score, candidate.sam_score)
+                break
+        if duplicate:
+            continue
+        merged.append(candidate)
+        if len(merged) >= max_candidates:
+            break
+    return relabel_candidates(merged)
 
 
 def select_geometry_candidates(candidates: List[SegmentCandidate], top_k: int) -> List[SegmentCandidate]:
@@ -320,6 +468,8 @@ def summarize_candidate_pairs(candidates: List[SegmentCandidate]) -> List[Dict[s
                 na = np.asarray(a.plane_normal, dtype=np.float32)
                 nb = np.asarray(b.plane_normal, dtype=np.float32)
                 normal_alignment = float(abs(np.dot(na, nb) / max(np.linalg.norm(na) * np.linalg.norm(nb), 1e-6)))
+            pair_source_support = int("geometry" in a.candidate_source) + int("geometry" in b.candidate_source)
+            seam_shape_hint = "curve" if band_linearity < 0.22 and band_elongation > 2.0 else "line"
             pair_score = (
                 0.40 * np.clip(near_area / 18000.0, 0.0, 1.0)
                 + 0.25 * (normal_alignment if normal_alignment is not None else 0.0)
@@ -335,6 +485,8 @@ def summarize_candidate_pairs(candidates: List[SegmentCandidate]) -> List[Dict[s
                     "normal_alignment": normal_alignment,
                     "band_linearity": band_linearity,
                     "band_elongation": band_elongation,
+                    "pair_source_support": pair_source_support,
+                    "seam_shape_hint": seam_shape_hint,
                     "pair_score": float(pair_score),
                 }
             )
@@ -422,11 +574,13 @@ class QwenReasoner:
         if not self.is_available() or not candidates:
             return None
         ensure_dir(work_dir)
-        image_path = os.path.join(work_dir, f"{frame_id}_qwen_candidates.png")
+        raw_image_path = os.path.join(work_dir, f"{frame_id}_qwen_color.png")
+        overlay_image_path = os.path.join(work_dir, f"{frame_id}_qwen_candidates.png")
         candidates_json_path = os.path.join(work_dir, f"{frame_id}_qwen_candidates.json")
         output_json_path = os.path.join(work_dir, f"{frame_id}_qwen_reasoning.json")
         overlay = render_candidate_overlay(color, candidates)
-        imageio.imwrite(image_path, overlay)
+        imageio.imwrite(raw_image_path, color)
+        imageio.imwrite(overlay_image_path, overlay)
         payload = {
             "candidates": [candidate.to_dict() for candidate in candidates],
             "candidate_pairs": candidate_pairs,
@@ -437,8 +591,10 @@ class QwenReasoner:
         cmd = [
             self.python_executable,
             self.helper_script,
-            "--image_path",
-            image_path,
+            "--raw_image_path",
+            raw_image_path,
+            "--overlay_image_path",
+            overlay_image_path,
             "--candidates_json",
             candidates_json_path,
             "--output_json",
@@ -455,10 +611,83 @@ class QwenReasoner:
                 "status": "failed",
                 "stderr": proc.stderr.strip(),
                 "stdout": proc.stdout.strip(),
-                "overlay_path": image_path,
+                "raw_image_path": raw_image_path,
+                "overlay_path": overlay_image_path,
             }
         out = json.load(open(output_json_path, "r", encoding="utf-8"))
-        out["overlay_path"] = image_path
+        out["raw_image_path"] = raw_image_path
+        out["overlay_path"] = overlay_image_path
+        return out
+
+
+class GLMReasoner:
+    def __init__(self, python_executable: str, model_name: str, api_key_env: str, temperature: float) -> None:
+        self.python_executable = python_executable
+        self.model_name = model_name
+        self.api_key_env = api_key_env
+        self.temperature = temperature
+        self.helper_script = os.path.join(os.path.dirname(__file__), "glm_infer.py")
+
+    def is_available(self) -> bool:
+        return os.path.exists(self.python_executable) and os.path.exists(self.helper_script) and bool(os.environ.get(self.api_key_env) or os.environ.get("BIGMODEL_API_KEY"))
+
+    def select(
+        self,
+        color: np.ndarray,
+        candidates: List[SegmentCandidate],
+        candidate_pairs: List[Dict[str, object]],
+        work_dir: str,
+        frame_id: str,
+        prompt: str,
+    ) -> Optional[Dict[str, object]]:
+        if not self.is_available() or not candidates:
+            return None
+        ensure_dir(work_dir)
+        raw_image_path = os.path.join(work_dir, f"{frame_id}_glm_color.png")
+        overlay_image_path = os.path.join(work_dir, f"{frame_id}_glm_candidates.png")
+        candidates_json_path = os.path.join(work_dir, f"{frame_id}_glm_candidates.json")
+        output_json_path = os.path.join(work_dir, f"{frame_id}_glm_reasoning.json")
+        overlay = render_candidate_overlay(color, candidates)
+        imageio.imwrite(raw_image_path, color)
+        imageio.imwrite(overlay_image_path, overlay)
+        payload = {
+            "candidates": [candidate.to_dict() for candidate in candidates],
+            "candidate_pairs": candidate_pairs,
+            "prompt": prompt,
+        }
+        with open(candidates_json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        cmd = [
+            self.python_executable,
+            self.helper_script,
+            "--raw_image_path",
+            raw_image_path,
+            "--overlay_image_path",
+            overlay_image_path,
+            "--candidates_json",
+            candidates_json_path,
+            "--output_json",
+            output_json_path,
+            "--model_name",
+            self.model_name,
+            "--api_key_env",
+            self.api_key_env,
+            "--temperature",
+            str(self.temperature),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(output_json_path):
+            return {
+                "backend": "glm_online",
+                "status": "failed",
+                "stderr": proc.stderr.strip(),
+                "stdout": proc.stdout.strip(),
+                "raw_image_path": raw_image_path,
+                "overlay_path": overlay_image_path,
+            }
+        out = json.load(open(output_json_path, "r", encoding="utf-8"))
+        out["raw_image_path"] = raw_image_path
+        out["overlay_path"] = overlay_image_path
         return out
 
 

@@ -217,6 +217,24 @@ def groove_mask_from_centerline(points_uv: np.ndarray, shape: Tuple[int, int], t
     return mask > 0
 
 
+def split_surface_mask_by_seam(surface_mask: np.ndarray, seam_band_mask: np.ndarray, min_area_px: int = 3000) -> List[np.ndarray]:
+    if surface_mask.shape != seam_band_mask.shape:
+        raise ValueError("surface_mask and seam_band_mask must have the same shape")
+    band = cv2.dilate(seam_band_mask.astype(np.uint8), np.ones((7, 7), np.uint8), iterations=1).astype(bool)
+    residual = surface_mask & (~band)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(residual.astype(np.uint8), 8)
+    components: List[np.ndarray] = []
+    for idx in range(1, num_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < min_area_px:
+            continue
+        comp = labels == idx
+        comp = cv2.morphologyEx(comp.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1).astype(bool)
+        components.append(comp)
+    components.sort(key=lambda m: int(m.sum()), reverse=True)
+    return components[:2]
+
+
 def smooth_centerline(points_uv: np.ndarray, window: int = 7) -> np.ndarray:
     if points_uv is None or len(points_uv) < 5:
         return points_uv
@@ -329,6 +347,7 @@ def _fit_line_outputs(points_3d: np.ndarray, uv: np.ndarray, approach: np.ndarra
     end = center + seam_dir * proj.max()
     return {
         "groove_mask": None,
+        "seam_shape": "line",
         "centerline_pixels": uv.astype(np.float32),
         "centerline_points_m": points_3d.astype(np.float32),
         "target_point_m": center.astype(np.float32),
@@ -337,6 +356,84 @@ def _fit_line_outputs(points_3d: np.ndarray, uv: np.ndarray, approach: np.ndarra
         "weld_start_point_m": start.astype(np.float32),
         "weld_end_point_m": end.astype(np.float32),
     }
+
+
+def _arc_length_resample_indices(points_uv: np.ndarray, num_samples: int) -> np.ndarray:
+    if len(points_uv) <= 2 or num_samples >= len(points_uv):
+        return np.arange(len(points_uv), dtype=np.int32)
+    seg = np.linalg.norm(points_uv[1:] - points_uv[:-1], axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg.astype(np.float32))], axis=0)
+    total = float(arc[-1])
+    if total <= 1e-6:
+        return np.linspace(0, len(points_uv) - 1, num_samples).astype(np.int32)
+    targets = np.linspace(0.0, total, num_samples, dtype=np.float32)
+    out: List[int] = []
+    for t in targets:
+        idx = int(np.searchsorted(arc, t, side="left"))
+        idx = int(np.clip(idx, 0, len(points_uv) - 1))
+        out.append(idx)
+    return np.asarray(sorted(set(out)), dtype=np.int32)
+
+
+def _fit_curve_outputs(points_3d: np.ndarray, uv: np.ndarray, approach: np.ndarray) -> Dict[str, np.ndarray]:
+    idx = _arc_length_resample_indices(uv.astype(np.float32), num_samples=min(48, max(16, len(uv) // 2)))
+    uv_curve = uv[idx].astype(np.float32)
+    points_curve = points_3d[idx].astype(np.float32)
+    if len(points_curve) < 3:
+        return _fit_line_outputs(points_3d, uv, approach)
+
+    center_idx = len(points_curve) // 2
+    target = points_curve[center_idx]
+    prev_idx = max(center_idx - 1, 0)
+    next_idx = min(center_idx + 1, len(points_curve) - 1)
+    seam_dir = points_curve[next_idx] - points_curve[prev_idx]
+    seam_norm = float(np.linalg.norm(seam_dir))
+    if seam_norm < 1e-6:
+        seam_dir = points_curve[-1] - points_curve[0]
+        seam_norm = float(np.linalg.norm(seam_dir))
+    if seam_norm < 1e-6:
+        return _fit_line_outputs(points_3d, uv, approach)
+    seam_dir = seam_dir / seam_norm
+    if seam_dir[2] > 0:
+        seam_dir = -seam_dir
+
+    return {
+        "groove_mask": None,
+        "seam_shape": "curve",
+        "centerline_pixels": uv_curve,
+        "centerline_points_m": points_curve,
+        "target_point_m": target.astype(np.float32),
+        "seam_direction_camera": seam_dir.astype(np.float32),
+        "approach_direction_camera": approach.astype(np.float32),
+        "weld_start_point_m": points_curve[0].astype(np.float32),
+        "weld_end_point_m": points_curve[-1].astype(np.float32),
+    }
+
+
+def fit_seam_geometry(
+    points_3d: np.ndarray,
+    uv: np.ndarray,
+    approach: np.ndarray,
+    straightness: float,
+    smoothness: float,
+    curvature_map: Optional[np.ndarray] = None,
+    support_uv: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
+    seam_shape = "line"
+    if straightness < 0.82 and smoothness >= 0.45:
+        seam_shape = "curve"
+    elif curvature_map is not None and support_uv is not None and len(support_uv) > 0:
+        curve_vals = curvature_map[support_uv[:, 1], support_uv[:, 0]]
+        curve_strength = float(np.percentile(curve_vals, 75)) if len(curve_vals) else 0.0
+        if straightness < 0.88 and curve_strength > 0.015:
+            seam_shape = "curve"
+
+    if seam_shape == "curve":
+        out = _fit_curve_outputs(points_3d, uv, approach)
+    else:
+        out = _fit_line_outputs(points_3d, uv, approach)
+    out["seam_shape_score"] = np.array([straightness, smoothness], dtype=np.float32)
+    return out
 
 
 def extract_groove_from_roi(
@@ -449,7 +546,15 @@ def extract_groove_from_roi(
 
     approach = -points_3d.mean(axis=0)
     approach = approach / max(np.linalg.norm(approach), 1e-6)
-    out = _fit_line_outputs(points_3d, uv, approach)
+    out = fit_seam_geometry(
+        points_3d=points_3d,
+        uv=uv,
+        approach=approach,
+        straightness=straightness,
+        smoothness=smoothness,
+        curvature_map=curvature,
+        support_uv=uv,
+    )
     out["groove_mask"] = groove_mask
     out["thick_band_mask"] = thick_band_mask
     out["thin_seam_mask"] = thin_seam_mask

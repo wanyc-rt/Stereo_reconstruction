@@ -9,10 +9,14 @@ from .config import WeldDetectionConfig
 from .detector import HeuristicPlateDetector, OpenVocabularyDetector
 from .geometry import depth_to_xyz, extract_groove_from_roi, generate_waypoints
 from .hybrid import (
+    GLMReasoner,
     QwenReasoner,
     SAMSegmenter,
     build_joint_roi_mask,
+    build_geometry_candidates,
     build_segment_candidates,
+    merge_candidate_sources,
+    relabel_candidates,
     resolve_reasoned_candidates,
     select_geometry_candidates,
     serialize_reasoning_for_json,
@@ -57,8 +61,19 @@ class WeldDetectionPipeline:
             model_path=config.qwen_model_path,
             max_new_tokens=config.qwen_max_new_tokens,
         ) if config.enable_qwen else None
+        self.glm_reasoner = GLMReasoner(
+            python_executable=config.qwen_python_executable,
+            model_name=config.glm_model_name,
+            api_key_env=config.glm_api_key_env,
+            temperature=config.glm_temperature,
+        ) if config.enable_glm else None
         self._runtime_window_name = 'weld_runtime'
         self._runtime_popup_enabled = self._resolve_runtime_popup_enabled()
+
+    def _select_reasoner(self):
+        if self.config.reasoner_backend == 'glm' and self.glm_reasoner is not None:
+            return self.glm_reasoner
+        return self.qwen_reasoner
 
 
     def _resolve_runtime_popup_enabled(self) -> bool:
@@ -123,6 +138,96 @@ class WeldDetectionPipeline:
         if extra:
             payload.update(extra)
         save_json(os.path.join(debug_dir, f'{frame_id}_debug.json'), payload)
+
+    def _build_hybrid_detection(
+        self,
+        color: np.ndarray,
+        depth_m: np.ndarray,
+        xyz_map: np.ndarray,
+        valid: np.ndarray,
+        output_dir: str,
+        frame_id: str,
+    ) -> Optional[Dict[str, object]]:
+        heuristic_result = self.heuristic_detector.detect(color, depth_m, xyz_map, valid)
+        heuristic_candidates = build_geometry_candidates(heuristic_result.get("plates", []), valid)
+
+        sam_candidates = []
+        if self.sam_segmenter is not None and self.sam_segmenter.is_available():
+            sam_dir = os.path.join(output_dir, "sam")
+            ensure_dir(sam_dir)
+            segment_masks = self.sam_segmenter.generate(color, sam_dir, frame_id)
+            if segment_masks:
+                sam_candidates = build_segment_candidates(
+                    segment_masks=segment_masks,
+                    xyz_map=xyz_map,
+                    valid_mask=valid,
+                    min_mask_area_px=self.config.sam_min_mask_area_px,
+                    plane_distance_threshold_m=self.config.plane_distance_threshold_m,
+                    min_plane_points=self.config.min_plane_points,
+                )
+
+        merged_candidates = merge_candidate_sources(
+            sam_candidates=sam_candidates[: self.config.sam_top_k_candidates],
+            geometry_candidates=heuristic_candidates[:2],
+            max_candidates=self.config.sam_top_k_candidates + 2,
+        )
+        if not merged_candidates and not heuristic_result.get("plates"):
+            return None
+        candidate_pairs = summarize_candidate_pairs(merged_candidates)
+        reasoning = None
+        reasoner = self._select_reasoner()
+        if reasoner is not None:
+            sam_dir = os.path.join(output_dir, "sam")
+            ensure_dir(sam_dir)
+            reasoning = reasoner.select(color, merged_candidates, candidate_pairs, sam_dir, frame_id, self.config.prompt)
+        selected = resolve_reasoned_candidates(merged_candidates, reasoning, candidate_pairs=candidate_pairs, top_k=2)
+        if not selected:
+            selected = select_geometry_candidates(merged_candidates, top_k=2)
+        if not selected:
+            plates = heuristic_result.get("plates", [])
+            roi_mask = heuristic_result.get("roi_mask")
+            if not plates or roi_mask is None:
+                return None
+            return {
+                "plates": plates,
+                "roi_mask": roi_mask,
+                "supports_single_plate_roi": False,
+                "sam_candidates": [candidate.to_dict() for candidate in relabel_candidates(sam_candidates[: self.config.sam_top_k_candidates])],
+                "geometry_candidates": [candidate.to_dict() for candidate in relabel_candidates(heuristic_candidates[:2])],
+                "merged_candidates": [candidate.to_dict() for candidate in merged_candidates],
+                "candidate_pairs": candidate_pairs,
+                "reasoning": serialize_reasoning_for_json(reasoning),
+                "roi_construction": {"mode": "heuristic_fallback"},
+                "backend": "heuristic",
+            }
+
+        roi_mask, roi_meta = build_joint_roi_mask(selected)
+        plates: List[Dict[str, object]] = []
+        for candidate in selected:
+            plates.append(
+                {
+                    "mask": candidate.mask,
+                    "bbox": candidate.bbox,
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_source": candidate.candidate_source,
+                    "geometry_score": candidate.geometry_score,
+                    "plane_normal": candidate.plane_normal,
+                    "plane_inlier_ratio": candidate.plane_inlier_ratio,
+                    "plane_offset_m": candidate.plane_offset_m,
+                }
+            )
+        return {
+            "plates": plates,
+            "roi_mask": roi_mask,
+            "supports_single_plate_roi": True,
+            "sam_candidates": [candidate.to_dict() for candidate in relabel_candidates(sam_candidates[: self.config.sam_top_k_candidates])],
+            "geometry_candidates": [candidate.to_dict() for candidate in relabel_candidates(heuristic_candidates[:2])],
+            "merged_candidates": [candidate.to_dict() for candidate in merged_candidates],
+            "candidate_pairs": candidate_pairs,
+            "reasoning": serialize_reasoning_for_json(reasoning),
+            "roi_construction": roi_meta,
+            "backend": "hybrid_qwen" if reasoning is not None and reasoning.get("status") != "failed" else "hybrid_geometry",
+        }
 
     def _detect_with_sam(self, color: np.ndarray, xyz_map: np.ndarray, valid: np.ndarray, output_dir: str, frame_id: str) -> Optional[Dict[str, object]]:
         if self.sam_segmenter is None or not self.sam_segmenter.is_available():
@@ -244,8 +349,8 @@ class WeldDetectionPipeline:
             return None
 
         detect_result = None
-        if frame.get('color_path') and self.sam_segmenter is not None:
-            detect_result = self._detect_with_sam(color, xyz_map, valid, output_dir, frame['frame_id'])
+        if frame.get('color_path'):
+            detect_result = self._build_hybrid_detection(color, depth_m, xyz_map, valid, output_dir, frame['frame_id'])
         if detect_result is None:
             detector = self._select_detector()
             detect_result = detector.detect(color, depth_m, xyz_map, valid)
@@ -370,6 +475,7 @@ class WeldDetectionPipeline:
             'target_point_m': groove['target_point_m'].tolist(),
             'approach_direction_camera': groove['approach_direction_camera'].tolist(),
             'seam_direction_camera': groove['seam_direction_camera'].tolist(),
+            'seam_shape': groove.get('seam_shape', 'line'),
             'weld_start_point_m': groove['weld_start_point_m'].tolist(),
             'weld_end_point_m': groove['weld_end_point_m'].tolist(),
             'centerline_pixels': groove['centerline_pixels'].tolist(),
@@ -378,6 +484,8 @@ class WeldDetectionPipeline:
             'waypoints': {k: v.tolist() for k, v in waypoints.items()},
             'detector_backend': detect_result.get('backend', 'heuristic'),
             'sam_candidates': detect_result.get('sam_candidates'),
+            'geometry_candidates': detect_result.get('geometry_candidates'),
+            'merged_candidates': detect_result.get('merged_candidates'),
             'candidate_pairs': detect_result.get('candidate_pairs'),
             'reasoning': detect_result.get('reasoning'),
             'roi_construction': detect_result.get('roi_construction'),

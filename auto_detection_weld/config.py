@@ -32,7 +32,12 @@ class WeldDetectionConfig:
     sam_max_masks: int = 24
     sam_min_mask_area_px: int = 6000
     sam_top_k_candidates: int = 6
+    reasoner_backend: str = "qwen"
     enable_qwen: bool = False
     qwen_python_executable: str = "/home/wycaihyj/miniconda3/envs/python39/bin/python"
     qwen_model_path: str = "/home/wycaihyj/Documents/WYC/Data/Qwen2.5-vl-7B/2026"
     qwen_max_new_tokens: int = 256
+    enable_glm: bool = False
+    glm_model_name: str = "glm-5v-turbo"
+    glm_api_key_env: str = "ZAI_API_KEY"
+    glm_temperature: float = 0.3

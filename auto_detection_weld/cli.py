@@ -45,10 +45,15 @@ def main() -> None:
     parser.add_argument('--sam_max_masks', type=int, default=24)
     parser.add_argument('--sam_min_mask_area_px', type=int, default=6000)
     parser.add_argument('--sam_top_k_candidates', type=int, default=6)
+    parser.add_argument('--reasoner_backend', type=str, default='qwen', choices=['qwen', 'glm'])
     parser.add_argument('--enable_qwen', type=int, default=0)
     parser.add_argument('--qwen_python_executable', type=str, default="/home/wycaihyj/miniconda3/envs/python39/bin/python")
     parser.add_argument('--qwen_model_path', type=str, default="/home/wycaihyj/Documents/WYC/Data/Qwen2.5-vl-7B/2026")
     parser.add_argument('--qwen_max_new_tokens', type=int, default=256)
+    parser.add_argument('--enable_glm', type=int, default=0)
+    parser.add_argument('--glm_model_name', type=str, default='glm-5v-turbo')
+    parser.add_argument('--glm_api_key_env', type=str, default='ZAI_API_KEY')
+    parser.add_argument('--glm_temperature', type=float, default=0.3)
     args = parser.parse_args()
 
     cfg = WeldDetectionConfig(
@@ -73,10 +78,15 @@ def main() -> None:
         sam_max_masks=args.sam_max_masks,
         sam_min_mask_area_px=args.sam_min_mask_area_px,
         sam_top_k_candidates=args.sam_top_k_candidates,
+        reasoner_backend=args.reasoner_backend,
         enable_qwen=bool(args.enable_qwen),
         qwen_python_executable=args.qwen_python_executable,
         qwen_model_path=args.qwen_model_path,
         qwen_max_new_tokens=args.qwen_max_new_tokens,
+        enable_glm=bool(args.enable_glm),
+        glm_model_name=args.glm_model_name,
+        glm_api_key_env=args.glm_api_key_env,
+        glm_temperature=args.glm_temperature,
     )
     pipeline = WeldDetectionPipeline(cfg)
     pipeline.run_sequence(
